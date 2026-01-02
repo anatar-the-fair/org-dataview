@@ -3,7 +3,7 @@
 ;; Author: Rasmus Sten
 ;; Version: 1.0.0
 ;; Keywords: org, sqlite, database, frontmatter
-;; URL: https://github.com/yourname/org-dataview
+;; URL: https://github.com/anatar-the-fair/org-dataview
 ;; Package-Requires: ((emacs "30.2")), have not tested other versions
 
 ;; This program is free software: you can redistribute it and/or modify
