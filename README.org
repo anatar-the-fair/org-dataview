@@ -1,0 +1,329 @@
+#+TITLE: org-dataview
+#+AUTHOR: Rasmus Sten
+#+VERSION: 1.0.0
+#+LICENSE: GPL-3.0
+
+* Overview
+
+org-dataview is an Emacs package that indexes Org-mode frontmatter into a SQLite
+database and provides a flexible query system to retrieve and display that data.
+
+The goal is to make Org files behave like a structured dataset without forcing
+any schema up front. If it exists as =#+KEY: value= at the top of an Org file,
+org-dataview can index it and query it.
+
+The design is inspired by tools like Obsidian Dataview, but implemented in
+idiomatic Emacs Lisp and tightly integrated with Org’s ID system.
+
+* Features
+
+- Indexes all =#+KEY: value= frontmatter entries in Org files
+- Uses Org IDs as stable primary keys
+- Stores data in a SQLite database for fast queries
+- Supports Org links in frontmatter (stores display text and link separately)
+- Relative path storage for portability across machines
+- Flexible query language:
+  - AND / OR filters
+  - Exact matches
+  - Numeric comparisons (>, <, >=, <=)
+  - Sorting (ASC / DESC)
+- Display results as Org lists or Org tables
+- Optional debug mode with verbose logging
+
+* Requirements
+
+- Emacs 30.2 (tested)
+- Built-in packages:
+  - org
+  - sqlite
+  - cl-lib
+
+Other Emacs versions may work but are untested.
+
+* Installation
+
+Clone the repository and add it to your load path:
+
+#+BEGIN_SRC emacs-lisp
+(add-to-list 'load-path "/path/to/org-dataview")
+(require 'org-dataview)
+#+END_SRC
+
+* Prerequisites
+
+org-dataview relies on Org’s ID system.
+
+Make sure you have this set:
+
+#+BEGIN_SRC emacs-lisp
+(setq org-id-locations-file "~/.emacs.d/.org-id-locations")
+#+END_SRC
+
+Your Org files should live under =org-directory=, since paths are stored
+relative to it.
+
+* Basic Workflow
+
+1. Ensure all headings have Org IDs
+2. Scan and index frontmatter
+3. Run queries
+
+* Step 1: Assign Org IDs
+
+Scan your Org directory and ensure all headings have IDs:
+
+#+BEGIN_SRC emacs-lisp
+M-x org-dataview-rescan
+#+END_SRC
+
+This will:
+- Visit all =.org= files under =org-directory=
+- Assign missing IDs
+- Update =org-id-locations-file=
+- Convert stored paths to relative paths
+
+* Step 2: Index Frontmatter
+
+Index frontmatter for all known Org IDs:
+
+#+BEGIN_SRC emacs-lisp
+M-x org-dataview-scan-orgid-locations
+#+END_SRC
+
+This:
+- Parses consecutive =#+KEY:= lines at the top of each file
+- Stores key/value pairs in SQLite
+- Inserts a synthetic =file= entry for each ID
+
+The database is stored at:
+
+#+BEGIN_EXAMPLE
+user-emacs-directory/org_dataview.db
+#+END_EXAMPLE
+
+* Frontmatter Rules
+
+- Only consecutive =#+KEY:= lines at the top of the file are indexed
+- Parsing stops at the first non-frontmatter line
+- Keys are lowercased internally
+- Org links like =[[id:UUID][Title]]= are split into:
+  - value: Title
+  - link: id:UUID
+
+* Querying Data
+
+The core query function is:
+
+#+BEGIN_SRC emacs-lisp
+(org-dataview-query
+ :columns (...)
+ :filter ...
+ :sort ...
+ :link-display ...)
+#+END_SRC
+
+** Columns
+
+A list of frontmatter keys to return:
+
+#+BEGIN_SRC emacs-lisp
+:columns '("title" "author" "date")
+#+END_SRC
+
+To retrieve a link instead of a value, use =.link=:
+
+#+BEGIN_SRC emacs-lisp
+:columns '("title" "file.link")
+#+END_SRC
+
+** Filters
+
+Simple string filter (matches =filetags= using LIKE):
+
+#+BEGIN_SRC emacs-lisp
+:filter "book"
+#+END_SRC
+
+Exact match:
+
+#+BEGIN_SRC emacs-lisp
+:filter '("status" "read")
+#+END_SRC
+
+AND / OR logic:
+
+#+BEGIN_SRC emacs-lisp
+:filter '(:and
+          ("type" "book")
+          ("status" "read"))
+#+END_SRC
+
+Numeric comparisons:
+
+#+BEGIN_SRC emacs-lisp
+:filter '("year" ">=2020")
+#+END_SRC
+
+** Sorting
+
+#+BEGIN_SRC emacs-lisp
+:sort '(("date" . desc))
+#+END_SRC
+
+Multiple columns are supported.
+
+** Link Display
+
+If you want the =title= column rendered as an Org link using the file ID:
+
+#+BEGIN_SRC emacs-lisp
+:link-display 'title
+#+END_SRC
+
+* Displaying Results
+
+For interactive use:
+
+#+BEGIN_SRC emacs-lisp
+M-x org-dataview-display
+#+END_SRC
+
+- Single column → Org list
+- Multiple columns → Org table
+- Results are shown in =*Org Dataview Results*=
+
+* Debugging
+
+Enable verbose logging:
+
+#+BEGIN_SRC emacs-lisp
+M-x org-dataview-toggle-debug
+#+END_SRC
+
+When enabled, all internal steps and SQL queries are logged.
+
+* Utilities
+
+Inspect database contents:
+
+#+BEGIN_SRC emacs-lisp
+M-x org-dataview-inspect
+#+END_SRC
+
+Clear database (with confirmation):
+
+#+BEGIN_SRC emacs-lisp
+M-x org-dataview-clear-database
+#+END_SRC
+
+Test database connection and inserts:
+
+#+BEGIN_SRC emacs-lisp
+M-x org-dataview-test-connection
+#+END_SRC
+
+Minimal sanity test:
+
+#+BEGIN_SRC emacs-lisp
+M-x org-dataview-test-simple
+#+END_SRC
+
+* Database Schema
+
+#+BEGIN_EXAMPLE
+TABLE org_files (
+  id    TEXT NOT NULL,
+  key   TEXT NOT NULL,
+  value TEXT,
+  link  TEXT,
+  PRIMARY KEY (id, key)
+)
+#+END_EXAMPLE
+
+Each row represents one frontmatter key for one Org ID.
+
+** Obsidian Dataview Comparision
+
+The dataview plugin allows you to write:
+
+```dataview
+TABLE title, author, year
+FROM #book
+WHERE year >= 2020
+SORT year DESC
+```
+
+Which assumes YAML like:
+
+---
+title: Example Book
+author: Someone
+year: 2022
+tags: [book]
+---
+
+In Emacs with =org-dataview=, this becomes (which you have to evaluate):
+
+#+begin_src emacs-lisp
+(org-dataview-query
+ :columns '("title" "author" "year")
+ :filter '(:and
+           ("filetags" "book")
+           ("year" ">=2020"))
+ :sort '(("year" . desc)))
+#+end_src
+
+Which assumes frontmatter like:
+
+TITLE: Example Book
+#+AUTHOR: Someone
+#+YEAR: 2022
+#+FILETAGS: book
+
+* Design Notes
+
+- No schema migration: keys are discovered dynamically
+- IDs are the only stable identifier
+- SQLite is used directly for performance and simplicity
+- SQL is generated programmatically; no ORM layer
+
+* License
+
+This project is licensed under the GNU General Public License v3 or later.
+See the LICENSE file for details.
+
+* Project Status
+
+This repository is my real, public GitHub account.
+
+org-dataview is provided as a working, usable tool, but I do not intend to be an
+active or long-term maintainer. The code is published for others to use, study,
+or extend, not as a promise of ongoing development, support, or feature work.
+
+Issues and pull requests may be read, but responses and updates are not
+guaranteed.
+
+* Worklist
+- [X] Add a setting that adds in the filename with the link
+- [X] Enable list feature
+- [ ] Display column header: file.link AS "Title"
+- [ ] Test the WHERE feature for file paths
+- [ ] Smart sort setting:
+  + [ ] Sort author by lastname,
+  + [ ] Books by title minus "The"
+
+* Project Status and Authorship
+
+org-dataview is provided as a working, usable tool, but I do not intend to be an
+active or long-term maintainer. This repository reflects a personal solution
+that I decided to publish in case it is useful to others. It is not a promise
+of ongoing development, support, or feature work.
+
+Most, if not all, of the code was written with the help of AI tools. As a result,
+the design may be rough or inelegant. I do not claim special credit for the
+implementation; the primary goal was to build functionality for my own Emacs
+setup that others might also find useful.
+
+Issues and pull requests may be read, but responses, reviews, and updates are not
+guaranteed. This is my first public GitHub repository, and both time and
+programming experience are limited.
