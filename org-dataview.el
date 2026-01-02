@@ -1,7 +1,7 @@
 ;;; org-dataview.el --- Query and index Org frontmatter in SQLite database -*- lexical-binding: t; -*-
 
 ;; Author: Rasmus Sten
-;; Version: 1.0.0
+;; Version: 1.0.1
 ;; Keywords: org, sqlite, database, frontmatter
 ;; URL: https://github.com/anatar-the-fair/org-dataview
 ;; Package-Requires: ((emacs "30.2")), have not tested other versions
@@ -80,28 +80,34 @@ STR is the string to escape. Returns escaped string."
       (replace-regexp-in-string "'" "''" str)
     ""))
 
+
 ;; ==================== Indexing Core Functions ====================
 
 (defun org-dataview--read-orgids ()
   "Return alist of (ID . relative-path) for all headings with Org IDs.
 Paths are relative to `org-directory`.
-Uses `org-id-locations-file' to find IDs."
+Uses `org-id-locations-file' to find IDs.
+Filters duplicates to ensure each ID appears only once.
+DOES NOT create or modify any IDs - only reads existing ones."
   (org-dataview--debug "Reading Org IDs from %s" org-id-locations-file)
   (when (and (boundp 'org-id-locations-file)
              (file-exists-p org-id-locations-file))
     (org-dataview--debug "org-id-locations-file exists, proceeding to read")
     (with-temp-buffer
       (insert-file-contents org-id-locations-file)
-      (let ((data (read (current-buffer))))
+      (let ((data (read (current-buffer)))
+            (id-table (make-hash-table :test 'equal))
+            (result '()))
         (org-dataview--debug "Read %d ID entries from file" (length data))
-        ;; Return alist (ID . relative-path)
-        (mapcar (lambda (pair)
-                  (let ((abs-path (car pair))
-                        (id (cadr pair))
-                        (rel-path (file-relative-name (car pair) org-directory)))
-                    (org-dataview--debug "Using relative path for DB: %s" rel-path)
-                    (cons id rel-path)))
-                data)))))
+        ;; Filter duplicates - keep only the first occurrence of each ID
+        (dolist (pair data)
+          (let ((abs-path (car pair))
+                (id (cadr pair))
+                (rel-path (file-relative-name (car pair) org-directory)))
+            (unless (gethash id id-table)
+              (puthash id t id-table)
+              (push (cons id rel-path) result))))
+        (nreverse result)))))
 
 (defun org-dataview--parse-frontmatter ()
   "Parse consecutive #+KEY: lines at the top of the buffer.
@@ -124,15 +130,18 @@ Returns nil if no frontmatter found."
         result))))
 
 (defun org-dataview--extract-link (text)
-  "If TEXT contains an Org link [[id:UUID][Display]], return (display . link).
+  "If TEXT contains an Org link [[id:UUID][Display]], return (display . full-link).
 Otherwise return (text . nil).
-TEXT is the string to parse for Org links."
+TEXT is the string to parse for Org links.
+Returns the FULL link including brackets, not just the id: part."
   (org-dataview--debug "Extracting link from text: %s" text)
-  (if (string-match "\\[\\[\\([^]]+\\)\\]\\[\\([^]]+\\)\\]\\]" text)
-      (let ((link (match-string 1 text))
-            (display (match-string 2 text)))
-        (org-dataview--debug "Found Org link: %s -> %s" display link)
-        (cons display link))
+  (if (string-match "\\(\\[\\[[^]]+\\]\\[[^]]+\\]\\]\\)" text)
+      (let ((full-link (match-string 1 text)))
+        ;; Now extract just the display text for the value
+        (string-match "\\[\\[[^]]+\\]\\[\\([^]]+\\)\\]\\]" full-link)
+        (let ((display (match-string 1 full-link)))
+          (org-dataview--debug "Found Org link: %s -> %s" display full-link)
+          (cons display full-link)))
     (progn
       (org-dataview--debug "No Org link found in text")
       (cons text nil))))
@@ -142,7 +151,7 @@ TEXT is the string to parse for Org links."
 DB is the SQLite database connection."
   (org-dataview--debug "Ensuring table exists in database")
   (sqlite-execute db
-    "CREATE TABLE IF NOT EXISTS org_files (
+                  "CREATE TABLE IF NOT EXISTS org_files (
         id TEXT NOT NULL,
         key TEXT NOT NULL,
         value TEXT,
@@ -160,67 +169,203 @@ Returns t on success, nil on failure."
       (progn
         (if link
             (sqlite-execute db
-              (format "INSERT OR REPLACE INTO org_files (id, key, value, link) VALUES ('%s', '%s', '%s', '%s')"
-                      (org-dataview--sqlite-escape-string id)
-                      (org-dataview--sqlite-escape-string key)
-                      (org-dataview--sqlite-escape-string display)
-                      (org-dataview--sqlite-escape-string link)))
+                            (format "INSERT OR REPLACE INTO org_files (id, key, value, link) VALUES ('%s', '%s', '%s', '%s')"
+                                    (org-dataview--sqlite-escape-string id)
+                                    (org-dataview--sqlite-escape-string key)
+                                    (org-dataview--sqlite-escape-string display)
+                                    (org-dataview--sqlite-escape-string link)))
           (sqlite-execute db
-            (format "INSERT OR REPLACE INTO org_files (id, key, value, link) VALUES ('%s', '%s', '%s', NULL)"
-                    (org-dataview--sqlite-escape-string id)
-                    (org-dataview--sqlite-escape-string key)
-                    (org-dataview--sqlite-escape-string display))))
+                          (format "INSERT OR REPLACE INTO org_files (id, key, value, link) VALUES ('%s', '%s', '%s', NULL)"
+                                  (org-dataview--sqlite-escape-string id)
+                                  (org-dataview--sqlite-escape-string key)
+                                  (org-dataview--sqlite-escape-string display))))
         t) ; Return success
     (error
-     (if org-dataview-debug-mode
+     ;; Always log errors, not just in debug mode
+     (message "ORG-DATAVIEW ERROR: Failed to insert %s = %s: %s" key display err)
+     ;; Try to insert at least the key with empty value
+     (condition-case err2
          (progn
-           (message "ORG-DATAVIEW ERROR: Failed to insert %s = %s: %s" key display err)
-           ;; Try to insert at least the key with empty value
-           (condition-case err2
-               (sqlite-execute db
-                 (format "INSERT OR REPLACE INTO org_files (id, key, value, link) VALUES ('%s', '%s', '', NULL)"
-                         (org-dataview--sqlite-escape-string id)
-                         (org-dataview--sqlite-escape-string key)))
-             (error
-              (message "ORG-DATAVIEW CRITICAL: Cannot insert empty value: %s" err2)))))
-     nil))) ; Return failure
+           (sqlite-execute db
+                           (format "INSERT OR REPLACE INTO org_files (id, key, value, link) VALUES ('%s', '%s', '', NULL)"
+                                   (org-dataview--sqlite-escape-string id)
+                                   (org-dataview--sqlite-escape-string key)))
+           (message "ORG-DATAVIEW: Inserted empty value for %s" key)
+           t) ; Still return success
+       (error
+        (message "ORG-DATAVIEW CRITICAL: Cannot insert empty value for %s: %s" key err2)
+        nil))))) ; Return failure
 
 (defun org-dataview--process-file (file id db)
   "Process FILE (relative to `org-directory`) and store its top frontmatter.
 FILE is the relative file path, ID is the Org ID, DB is the SQLite connection.
-Also stores a synthetic 'file' key with the filename and Org link [[id][title]].
-Returns t if frontmatter was found and processed, nil otherwise."
+First clears any existing data for this ID to prevent duplicates.
+Returns t if frontmatter was found and stored, nil otherwise.
+DOES NOT create or modify any IDs - only reads existing frontmatter."
   (let ((full-path (expand-file-name file org-directory))
         (found nil))
     (org-dataview--debug "Processing file: %s for ID: %s" full-path id)
     (when (file-exists-p full-path)
+      ;; First, delete any existing data for this ID to prevent duplicates
+      (sqlite-execute db
+                      (format "DELETE FROM org_files WHERE id='%s'"
+                              (org-dataview--sqlite-escape-string id)))
       (with-temp-buffer
         (insert-file-contents full-path)
-        (org-mode)
+        ;; Use fundamental-mode to avoid any Org mode hooks that might create IDs
+        (fundamental-mode)
         ;; -------------------------
         ;; 1. Parse frontmatter
         ;; -------------------------
         (let ((frontmatter (org-dataview--parse-frontmatter)))
-          (org-dataview--debug "Frontmatter found: %s" frontmatter)
-          (dolist (pair frontmatter)
-            (let* ((key (downcase (car pair)))
-                   (val (cdr pair))
-                   (parsed (org-dataview--extract-link val))
-                   (display (car parsed))
-                   (link (cdr parsed)))
-              (org-dataview--debug "Processing key: %s, value: %s" key val)
-              (when (org-dataview--insert-frontmatter db id key display link)
-                (setq found t)))))
-        ;; -------------------------
-        ;; 2. Insert synthetic 'file' row
-        ;; -------------------------
-        (let* ((title (file-name-nondirectory file))
-               (link (format "[[%s][%s]]" id title)))
-          (org-dataview--debug "Inserting synthetic 'file' row: %s → %s" title link)
-          (when (org-dataview--insert-frontmatter db id "file" title link)
-            (setq found t)))
-        ;; -------------------------
+          (if frontmatter
+              (progn
+                (org-dataview--debug "Frontmatter found: %s" frontmatter)
+                (dolist (pair frontmatter)
+                  (let* ((key (downcase (car pair)))
+                         (val (cdr pair))
+                         (parsed (org-dataview--extract-link val))
+                         (display (car parsed))
+                         (link (cdr parsed)))
+                    (org-dataview--debug "Processing key: %s, value: %s" key val)
+                    (when (org-dataview--insert-frontmatter db id key display link)
+                      (setq found t))))
+                ;; -------------------------
+                ;; 2. Insert synthetic 'file' row (filename only)
+                ;; -------------------------
+                (let* ((filename (file-name-nondirectory file))  ; Just the filename
+                       (link (format "[[id:%s][%s]]" id filename)))
+                  (org-dataview--debug "Inserting synthetic 'file' row: %s → %s" filename link)
+                  (when (org-dataview--insert-frontmatter db id "file" filename link)
+                    (setq found t)))
+                ;; -------------------------
+                ;; 3. Insert 'file.path' row (relative path)
+                ;; -------------------------
+                (org-dataview--debug "Inserting 'file.path' row: %s" file)
+                (when (org-dataview--insert-frontmatter db id "file.path" file nil)
+                  (setq found t)))
+            (org-dataview--debug "No frontmatter found in file %s" file)))
         found))))
+
+;; ==================== Public Indexing Interface ====================
+
+;;;###autoload
+(defun org-dataview-scan-orgid-locations (&optional db-file)
+  "Scan all headings listed in Org IDs and store their frontmatter in DB-FILE.
+If DB-FILE is nil, uses `org-dataview-default-location'.
+Displays progress in percent even if debug mode is off.
+This function updates the database with current frontmatter from all Org IDs.
+DOES NOT create or modify any IDs - only reads existing ones from org-id-locations-file."
+  (interactive)
+  (if org-dataview-debug-mode
+      (org-dataview--debug "Starting org-dataview-scan-orgid-locations")
+    (org-dataview--log "Starting scan of Org IDs"))
+  
+  (let* ((db-file (or db-file org-dataview-default-location))
+         (db (sqlite-open db-file))
+         (orgids (org-dataview--read-orgids))
+         (total (length orgids))
+         (processed 0)
+         (skipped 0)
+         (errors 0)
+         (last-percent -1)) ; Track last printed percent
+    (org-dataview--debug "Database file: %s" db-file)
+    (org-dataview--debug "Total Org IDs to process: %d" total)
+    
+    (unwind-protect
+        (progn
+          (org-dataview--ensure-table db)
+          
+          (dolist (pair orgids)
+            (let* ((id (car pair))
+                   (file (cdr pair))
+                   (found (condition-case err
+                              (org-dataview--process-file file id db)
+                            (error
+                             (message "ORG-DATAVIEW ERROR processing %s: %s" file err)
+                             (setq errors (1+ errors))
+                             nil))))
+              
+              (if found
+                  (setq processed (1+ processed))
+                (setq skipped (1+ skipped)))
+              
+              ;; Show progress in percent
+              (let* ((done (+ processed skipped errors))
+                     (percent (if (> total 0)
+                                  (/ (* done 100.0) total)
+                                100))
+                     (percent-int (floor percent)))
+                (when (/= percent-int last-percent)
+                  (setq last-percent percent-int)
+                  (message "ORG-DATAVIEW: Indexing progress: %d%% (%d/%d)"
+                           percent-int done total)))))
+          
+          ;; Final summary
+          (org-dataview--log "Scan complete - %d with frontmatter, %d without, %d errors"
+                             processed skipped errors))
+      
+      ;; Ensure DB is closed even if there's an error
+      (sqlite-close db))))
+
+;;;###autoload
+(defun org-dataview-rescan-files (&optional root-dir)
+  "Scan ROOT-DIR for Org files and collect metadata for existing IDs.
+Does NOT create new IDs - only scans existing ones.
+Does NOT call org-id-update-id-locations to avoid triggering ID creation.
+ROOT-DIR defaults to org-directory."
+  (interactive)
+  (if org-dataview-debug-mode
+      (org-dataview--debug "Starting org-dataview-rescan-files")
+    (org-dataview--log "Scanning for existing IDs (no new IDs will be created)"))
+  
+  ;; REMOVED: org-id-update-id-locations call that could trigger ID creation
+  ;; Simply scan the IDs that already exist in org-id-locations-file
+  (org-dataview-scan-orgid-locations)
+  
+  (if org-dataview-debug-mode
+      (org-dataview--debug "Rescan-files complete")
+    (org-dataview--log "Rescan-files complete: existing IDs scanned")))
+
+;;;###autoload
+(defun org-dataview-rescan-all (&optional root-dir)
+  "Scan ALL Org files in ROOT-DIR and collect metadata for existing IDs.
+Does NOT create new IDs - only scans existing ones.
+Does NOT call org-id-update-id-locations to avoid triggering ID creation.
+ROOT-DIR defaults to org-directory."
+  (interactive)
+  (if org-dataview-debug-mode
+      (org-dataview--debug "Starting org-dataview-rescan-all")
+    (org-dataview--log "Rescanning ALL files for existing IDs (no new IDs will be created)"))
+  
+  ;; REMOVED: org-id-update-id-locations call that could trigger ID creation
+  ;; Simply scan the IDs that already exist in org-id-locations-file
+  (org-dataview-scan-orgid-locations)
+  
+  (if org-dataview-debug-mode
+      (org-dataview--debug "Rescan-all complete")
+    (org-dataview--log "Rescan-all complete: existing IDs scanned")))
+
+(defun org-dataview--write-relative-orgids ()
+  "Convert all absolute paths in `org-id-locations-file` to relative paths.
+This makes the ID file portable across different machines/filesystems.
+DOES NOT create or modify any IDs - only converts path formats."
+  (org-dataview--debug "Writing relative Org IDs to %s" org-id-locations-file)
+  (when (and (boundp 'org-id-locations-file)
+             (file-exists-p org-id-locations-file))
+    (org-dataview--debug "org-id-locations-file exists, proceeding to convert paths")
+    (with-temp-buffer
+      (insert-file-contents org-id-locations-file)
+      (let* ((data (read (current-buffer)))
+             (rel-data
+              (mapcar (lambda (pair)
+                        (let ((abs-path (car pair))
+                              (id (cadr pair)))
+                          (list (file-relative-name abs-path org-directory) id)))
+                      data)))
+        (org-dataview--debug "Converted %d paths to relative format" (length rel-data))
+        (with-temp-file org-id-locations-file
+          (prin1 rel-data (current-buffer)))))))
 
 ;; ==================== Public Indexing Interface ====================
 
@@ -253,7 +398,12 @@ This function updates the database with current frontmatter from all Org IDs."
           (dolist (pair orgids)
             (let* ((id (car pair))
                    (file (cdr pair))
-                   (found (org-dataview--process-file file id db)))
+                   (found (condition-case err
+                              (org-dataview--process-file file id db)
+                            (error
+                             (message "ORG-DATAVIEW ERROR processing %s: %s" file err)
+                             (setq errors (1+ errors))
+                             nil))))
               
               (if found
                   (setq processed (1+ processed))
@@ -271,47 +421,53 @@ This function updates the database with current frontmatter from all Org IDs."
                            percent-int done total)))))
           
           ;; Final summary
-          (org-dataview--log "Scan complete - %d headings with frontmatter, %d without"
-                       processed skipped))
+          (org-dataview--log "Scan complete - %d with frontmatter, %d without, %d errors"
+                             processed skipped errors))
       
       ;; Ensure DB is closed even if there's an error
       (sqlite-close db))))
 
 ;;;###autoload
-(defun org-dataview-rescan (&optional root-dir)
-  "Scan entire ROOT-DIR (default `org-directory`) for Org headings and update `org-id-locations-file`.
-Stores paths relative to `org-directory`.
-This function ensures all Org headings have IDs and updates the index.
-ROOT-DIR is the directory to scan (defaults to org-directory)."
+(defun org-dataview-rescan-files (&optional root-dir)
+  "Scan ROOT-DIR for Org files and collect metadata for existing IDs.
+Does NOT create new IDs - only scans existing ones.
+ROOT-DIR defaults to org-directory."
   (interactive)
   (if org-dataview-debug-mode
-      (org-dataview--debug "Starting org-dataview-rescan")
-    (org-dataview--log "Rescanning Org vault for IDs"))
+      (org-dataview--debug "Starting org-dataview-rescan-files")
+    (org-dataview--log "Scanning for existing IDs (no new IDs will be created)"))
   
-  (let ((root (or root-dir org-directory)))
-    (org-dataview--debug "Scanning directory: %s" root)
-    
-    (dolist (file (directory-files-recursively root "\\.org$"))
-      (let ((already-open (get-file-buffer file))
-            (buf (find-file-noselect file)))
-        (org-dataview--debug "Processing file: %s (already open: %s)" file already-open)
-        (with-current-buffer buf
-          (org-mode)
-          (org-map-entries #'org-id-get-create))
-        (unless already-open
-          (kill-buffer buf))))
-    
-    (org-dataview--debug "Finished scanning files, updating ID locations")
-    
-    ;; Update Org's native ID locations file
-    (org-id-update-id-locations)
-    
-    ;; Convert paths to relative
-    (org-dataview--write-relative-orgids)
-    
-    (if org-dataview-debug-mode
-        (org-dataview--debug "Rescan complete")
-      (org-dataview--log "Rescan complete: all headings now have Org IDs"))))
+  ;; Update Org's ID locations
+  (org-id-update-id-locations)
+  (org-dataview--write-relative-orgids)
+  
+  ;; Now scan using the updated IDs
+  (org-dataview-scan-orgid-locations)
+  
+  (if org-dataview-debug-mode
+      (org-dataview--debug "Rescan-files complete")
+    (org-dataview--log "Rescan-files complete: existing IDs scanned")))
+
+;;;###autoload
+(defun org-dataview-rescan-all (&optional root-dir)
+  "Scan ALL Org files in ROOT-DIR and collect metadata for existing IDs.
+Does NOT create new IDs - only scans existing ones.
+ROOT-DIR defaults to org-directory."
+  (interactive)
+  (if org-dataview-debug-mode
+      (org-dataview--debug "Starting org-dataview-rescan-all")
+    (org-dataview--log "Rescanning ALL files for existing IDs (no new IDs will be created)"))
+  
+  ;; Update Org's ID locations
+  (org-id-update-id-locations)
+  (org-dataview--write-relative-orgids)
+  
+  ;; Now scan using the updated IDs
+  (org-dataview-scan-orgid-locations)
+  
+  (if org-dataview-debug-mode
+      (org-dataview--debug "Rescan-all complete")
+    (org-dataview--log "Rescan-all complete: existing IDs scanned")))
 
 (defun org-dataview--write-relative-orgids ()
   "Convert all absolute paths in `org-id-locations-file` to relative paths.
@@ -342,6 +498,7 @@ FILTER can be:
 - string: searches in 'filetags' column with LIKE
 - list: (:and filter1 filter2 ...) or (:or filter1 filter2 ...)
 - list: (key value) where value can have comparison operators: >, <, >=, <=
+  Special keys: 'file.path', 'file.name' for file path filtering
 Returns SQL WHERE clause as string."
   (org-dataview--debug "Building filter: %S" filter)
   (cond
@@ -366,25 +523,48 @@ Returns SQL WHERE clause as string."
        (let* ((key   (replace-regexp-in-string "'" "''" (car filter)))
               (value (cadr filter))
               (safev (replace-regexp-in-string "'" "''" value)))
+         
+         ;; Order matters! Check most specific first
          (cond
+          ;; 1. Special file path filters
+          ((string-equal key "file.path")
+           (format "id IN (SELECT id FROM org_files WHERE key='file.path' AND value LIKE '%s')"
+                   safev))
+          
+          ((string-equal key "file.name")
+           (format "id IN (SELECT id FROM org_files WHERE key='file' AND value = '%s')"
+                   safev))
+          
+          ;; 2. Numeric comparisons (check prefixes)
           ((string-prefix-p ">=" value)
            (format "id IN (SELECT id FROM org_files WHERE key='%s' AND CAST(value AS INTEGER) >= %s)"
                    key (substring value 2)))
+          
           ((string-prefix-p "<=" value)
            (format "id IN (SELECT id FROM org_files WHERE key='%s' AND CAST(value AS INTEGER) <= %s)"
                    key (substring value 2)))
+          
           ((string-prefix-p ">" value)
            (format "id IN (SELECT id FROM org_files WHERE key='%s' AND CAST(value AS INTEGER) > %s)"
                    key (substring value 1)))
+          
           ((string-prefix-p "<" value)
            (format "id IN (SELECT id FROM org_files WHERE key='%s' AND CAST(value AS INTEGER) < %s)"
                    key (substring value 1)))
+          
+          ;; 3. String with LIKE wildcard (%)
+          ((and (stringp value) (string-match-p "%" value))
+           (format "id IN (SELECT id FROM org_files WHERE key='%s' AND value LIKE '%s')"
+                   key safev))
+          
+          ;; 4. Exact match (default - MUST BE LAST)
           (t
            (format "id IN (SELECT id FROM org_files WHERE key='%s' AND value='%s')"
                    key safev)))))))
 
    (t
     (error "Invalid filter: %S" filter))))
+
 
 (defun org-dataview--build-column-expr (col)
   "Build SQL expression for column COL.
@@ -403,30 +583,27 @@ COL is the column name (string)."
               safe col))))
 
 (defun org-dataview--build-sort-clause (sort)
-  "Build SQL ORDER BY clause from SORT specification.
-SORT is an alist of (column . direction) where direction is asc or desc.
-Returns SQL ORDER BY clause as string, or nil if SORT is nil."
+  "Build SQL ORDER BY clause from SORT specification."
+  (message "DEBUG org-dataview--build-sort-clause: sort=%S (type: %s)" sort (type-of sort))
   (when sort
+    (message "DEBUG: sort is truthy but not nil, processing...")
     (concat
      "ORDER BY "
      (mapconcat
       (lambda (it)
+        (message "DEBUG: Processing sort item: %S" it)
         (format "\"%s\" %s"
                 (car it)
                 (upcase (symbol-name (cdr it)))))
       sort
       ", "))))
 
-(defun org-dataview--query (columns filter sort link-display)
-  "Core query function. Execute SQL query and return results.
-COLUMNS is a list of column names (strings).
-FILTER is the filter specification (see `org-dataview--build-filter-clause').
-SORT is the sort specification (see `org-dataview--build-sort-clause').
-LINK-DISPLAY can be 'title to format title as Org link.
-Returns (columns . rows) where rows is a list of row lists."
-  (org-dataview--debug "ENTER org-dataview--query")
-  (org-dataview--debug "link-display: %S" link-display)
-
+(defun org-dataview--query (columns column-aliases filter sort link-display)
+  "Core query function."
+  (message "=== DEBUG START org-dataview--query ===")
+  (message "Parameters: columns=%S, column-aliases=%S, filter=%S, sort=%S, link-display=%S"
+           columns column-aliases filter sort link-display)
+  
   (unless org-dataview-default-location
     (error "org-dataview-default-location is not set"))
 
@@ -436,80 +613,119 @@ Returns (columns . rows) where rows is a list of row lists."
   (let ((db (sqlite-open org-dataview-default-location)))
     (unwind-protect
         (let* ((where (org-dataview--build-filter-clause filter))
-               (cols  (mapcar #'org-dataview--build-column-expr columns))
+               ;; If link-display is 'title, we need both title and file.link
+               (need-title (equal link-display 'title))
+               (need-file-link (equal link-display 'title))
+               (all-columns (append columns
+                                    (when need-title (unless (member "title" columns) '("title")))
+                                    (when need-file-link (unless (member "file.link" columns) '("file.link")))))
+               (cols (mapcar #'org-dataview--build-column-expr all-columns))
                (sortc (org-dataview--build-sort-clause sort))
-               (sql   (format
-                       "SELECT %s FROM org_files WHERE %s GROUP BY id %s"
-                       (mapconcat #'identity cols ", ")
-                       where
-                       (or sortc ""))))
+               (sql (format
+                     "SELECT %s FROM org_files WHERE %s GROUP BY id %s"
+                     (mapconcat #'identity cols ", ")
+                     where
+                     (or sortc ""))))
 
-          (org-dataview--debug "SQL:\n%s" sql)
+          (message "DEBUG SQL: %s" sql)
 
-          (let* ((rows (sqlite-execute db sql))
+          (let* ((sql-result (sqlite-execute db sql))
+                 (rows (cond
+                        ((numberp sql-result)  ; sqlite-execute returns 0 for no results
+                         '())
+                        ((listp sql-result)    ; Normal case: list of rows
+                         sql-result)
+                        (t
+                         (error "Unexpected result from sqlite-execute: %S" sql-result))))
+                 ;; Apply column aliases to original columns
+                 (display-columns
+                  (mapcar (lambda (col)
+                            (or (cdr (assoc col column-aliases)) col))
+                          columns))
                  (processed
                   (mapcar
                    (lambda (row)
-                     (cl-loop
-                      for val in row
-                      for col in columns
-                      collect
-                      (cond
-                       ;; Special override: if link-display is 'title and this is the title column
-                       ((and (eq link-display 'title)
-                             (string-equal col "title"))
-                        (let ((file-link-index (cl-position "file.link" columns :test #'string-equal))
-                              (title val))
-                          (if (and file-link-index title)
-                              (let ((file-link (nth file-link-index row)))
-                                (if (and file-link (stringp file-link) (string-match "\\[\\[\\(.*?\\)\\]\\[" file-link))
-                                    (format "[[%s][%s]]" (match-string 1 file-link) title)
-                                  title))
-                            title)))
-                       ;; Default: return value as-is
-                       (t
-                        (or val "")))))
+                     (let ((row-as-list (append row nil))) ; Convert vector to list if needed
+                       ;; Process each requested column
+                       (mapcar 
+                        (lambda (col)
+                          ;; Find this column's value in the row
+                          (let ((val (cl-loop for i from 0
+                                              for c in all-columns
+                                              when (string-equal c col)
+                                              return (nth i row-as-list))))
+                            (cond
+                             ;; If link-display is 'title AND this is the "title" column
+                             ((and (equal link-display 'title)
+                                   (string-equal col "title"))
+                              (let ((title val)
+                                    ;; Find the file.link value
+                                    (file-link (cl-loop for i from 0
+                                                        for c in all-columns
+                                                        when (string-equal c "file.link")
+                                                        return (nth i row-as-list))))
+                                (if (and file-link title (stringp file-link))
+                                    (cond
+                                     ;; Extract UUID from [[id:UUID][filename]]
+                                     ((string-match "\\[\\[id:\\([^]]+\\)\\]\\[" file-link)
+                                      (let ((uuid (match-string 1 file-link)))
+                                        (format "[[id:%s][%s]]" uuid title)))
+                                     ;; Fallback: return title only
+                                     (t title))
+                                  ;; No file.link found, return title only
+                                  (or title ""))))
+                             ;; Any other column: return as-is
+                             (t
+                              (or val "")))))
+                        columns)))
                    rows)))
-            (cons columns processed)))
+            ;; DEBUG: Show what we're returning
+            (message "DEBUG: Returning %d rows: %S" (length processed) processed)
+            (cons display-columns processed)))
 
-      (sqlite-close db)
-      (org-dataview--debug "DB closed"))))
+      (sqlite-close db))))
 
 ;; ==================== Public Query Interface ====================
 
 ;;;###autoload
 (defun org-dataview-query (&rest args)
-  "Run a query against the Org frontmatter database.
-
-Keywords:
-  :columns   (required) list of column names (strings)
-  :filter    string | list
-  :sort      alist ((\"col\" . asc|desc) ...)
-  :link-display  'title (display title as [[uuid][title]])
-
-Examples:
-  (org-dataview-query :columns '(\"title\" \"author\") :filter \"book\")
-  (org-dataview-query :columns '(\"title\" \"date\") 
-                      :filter '(:and (\"type\" \"book\") (\"status\" \"read\"))
-                      :sort '((\"date\" . desc)))"
-  (org-dataview--debug "ENTER org-dataview-query")
-  (org-dataview--debug "Args: %S" args)
-
-  (let (columns filter sort link-display)
+  "Run a query against the Org frontmatter database."
+  (message "=== DEBUG START org-dataview-query ===")
+  (message "Args received: %S" args)
+  
+  (let (columns column-aliases filter sort link-display)
+    ;; Initialize defaults
+    (setq column-aliases nil
+          filter nil
+          sort nil
+          link-display nil)
+    
     ;; keyword parsing
+    (message "Parsing keywords...")
     (while args
       (let ((key (pop args)))
+        (message "Processing key: %S" key)
         (pcase key
-          (:columns       (setq columns (pop args)))
-          (:filter        (setq filter (pop args)))
-          (:sort          (setq sort (pop args)))
-          (:link-display  (setq link-display (pop args)))
+          (:columns         (setq columns (pop args)) (message "Set columns to: %S" columns))
+          (:column-aliases  (setq column-aliases (pop args)) (message "Set column-aliases to: %S" column-aliases))
+          (:filter          (setq filter (pop args)) (message "Set filter to: %S" filter))
+          (:sort            (setq sort (pop args)) 
+                           (message "Set sort to: %S (type: %s)" sort (type-of sort))
+                           ;; Ensure sort is properly formatted
+                           (when (and sort (not (listp sort)))
+                             (message "WARNING: sort is not a list, setting to nil")
+                             (setq sort nil)))
+          (:link-display    (setq link-display (pop args)) (message "Set link-display to: %S" link-display))
           (_ (error "Unknown keyword: %S" key)))))
-
+    
+    (message "Final values: columns=%S, column-aliases=%S, filter=%S, sort=%S, link-display=%S"
+             columns column-aliases filter sort link-display)
+    
     (unless columns
       (error ":columns is required"))
-
-    (org-dataview--query columns filter sort link-display)))
+    
+    (message "=== DEBUG END org-dataview-query ===")
+    (org-dataview--query columns column-aliases filter sort link-display)))
 
 ;;;###autoload
 (defun org-dataview-display (columns filter &optional sort link-display)
@@ -535,6 +751,7 @@ Opens results in *Org Dataview Results* buffer."
       ;; If single column, display as list
       (if (= (length cols) 1)
           (dolist (row rows)
+            (insert "- " (or (car row) "") "\n")
             (insert "- " (or (car row) "") "\n"))
         ;; Multiple columns, display as table
         (insert "| " (mapconcat #'identity (car results) " | ") " |\n")
@@ -628,16 +845,61 @@ Useful for verifying that the database setup is working correctly."
       
       (sqlite-close db))))
 
-(defun org-dataview-test-simple ()
-  "Minimal sanity test.
-Runs a simple query to verify the system is working."
+;;;###autoload
+(defun org-dataview-scan-file-ids (&optional root-dir)
+  "Scan Org files for file-level IDs (#+ID: value) and collect their metadata.
+Creates IDs for files that don't have them at the file level.
+ROOT-DIR defaults to org-directory."
   (interactive)
-  (let ((res
-         (org-dataview-query
-          :columns '("title" "filetags")
-          :filter "book")))
-    (message "Rows: %d" (length (cdr res)))
-    res))
+  (if org-dataview-debug-mode
+      (org-dataview--debug "Starting org-dataview-scan-file-ids")
+    (org-dataview--log "Scanning for file-level IDs"))
+  
+  (let ((root (or root-dir org-directory))
+        (files-processed 0)
+        (file-ids-found 0))
+    (org-dataview--debug "Scanning directory: %s" root)
+    
+    (dolist (file (directory-files-recursively root "\\.org$"))
+      (let ((already-open (get-file-buffer file))
+            (buf (find-file-noselect file)))
+        (org-dataview--debug "Processing file: %s" file)
+        (with-current-buffer buf
+          (org-mode)
+          (save-excursion
+            (goto-char (point-min))
+            ;; Look for file-level ID (#+ID: value)
+            (if (re-search-forward "^#\\+ID:[ \t]+\\([^ \t\n]+\\)" nil t)
+                ;; File has file-level ID
+                (let ((file-id (match-string 1)))
+                  (org-dataview--debug "File-level ID found: %s" file-id)
+                  (setq file-ids-found (1+ file-ids-found))
+                  ;; Add to org-id-locations if not already there
+                  (unless (org-id-find-id-in-file file-id file)
+                    (org-id-add-location file-id file)))
+              ;; No file-level ID, create one at the file level (NOT in headings)
+              (org-dataview--debug "No file-level ID, creating one")
+              (let ((file-id (org-id-new)))
+                (save-excursion
+                  (goto-char (point-min))
+                  (insert (format "#+ID: %s\n" file-id)))
+                (org-id-add-location file-id file)
+                (setq file-ids-found (1+ file-ids-found)))))
+          (setq files-processed (1+ files-processed)))
+        (unless already-open
+          (kill-buffer buf))))
+    
+    ;; Update Org's ID locations
+    (org-id-update-id-locations)
+    (org-dataview--write-relative-orgids)
+    
+    ;; Now scan using the updated IDs
+    (org-dataview-scan-orgid-locations)
+    
+    (if org-dataview-debug-mode
+        (org-dataview--debug "Scan-file-ids complete")
+      (org-dataview--log "Scan-file-ids complete: %d files processed, %d file-level IDs found/created" 
+                         files-processed file-ids-found))))
 
 ;; ==================== Provide ====================
 
